@@ -1,0 +1,7 @@
+/* Remove all default styles and keep only custom ones if needed */
+.max-w-2xl {
+  max-width: 42rem;
+  margin: 0 auto;
+}
+
+/* Add any app-specific styles here */
