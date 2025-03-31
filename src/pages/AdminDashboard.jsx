@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { collection, query, where, onSnapshot, updateDoc, doc, getDocs, serverTimestamp } from 'firebase/firestore';
+import { useNavigate } from 'react-router-dom';
+import { collection, query, where, onSnapshot, updateDoc, doc, getDocs, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { db, auth } from '../firebase';
 import { signOut } from 'firebase/auth';
 import { toast } from 'react-toastify';
@@ -11,6 +12,7 @@ const AdminDashboard = () => {
   const [selectedClaim, setSelectedClaim] = useState(null);
   const [activeTab, setActiveTab] = useState('claims');
   const [error, setError] = useState(null);
+  const navigate = useNavigate();
 
   const formatDate = (firebaseTimestamp) => {
     if (!firebaseTimestamp) return 'Unknown date';
@@ -38,20 +40,34 @@ const AdminDashboard = () => {
 
     const unsubscribeClaims = onSnapshot(
       query(collection(db, 'claims'), where('status', '==', 'pending')),
-      (snapshot) => {
+      async (snapshot) => {
         try {
-          const claims = snapshot.docs.map(doc => {
+          const claims = await Promise.all(snapshot.docs.map(async (doc) => {
             const data = doc.data();
+            
+            // Get item details
+            let itemData = {};
+            try {
+              const itemSnap = await getDoc(doc(db, 'items', data.itemId));
+              if (itemSnap.exists()) {
+                itemData = itemSnap.data();
+              }
+            } catch (error) {
+              console.error("Error fetching item:", error);
+            }
+
             return {
               id: doc.id,
               ...data,
+              ...itemData,
               postedDate: data.createdAt?.toDate()?.toLocaleDateString(),
               claimDate: data.updatedAt?.toDate()?.toLocaleDateString(),
               formattedDate: formatDate(data.createdAt),
               claimantName: data.claimantName || 'Unknown User',
-              finderName: data.postedBy?.name || 'Unknown Finder'
+              finderName: data.finderName || 'Unknown Finder'
             };
-          });
+          }));
+          
           setPendingClaims(claims);
           setError(null);
         } catch (error) {
@@ -74,63 +90,88 @@ const AdminDashboard = () => {
     };
   }, []);
 
-  const handleVerifyClaim = async (isApproved) => {
-    if (!selectedClaim) return;
+  const handleVerifyClaim = async (isApproved, claimId = null) => {
+    const claimToProcess = claimId 
+      ? pendingClaims.find(c => c.id === claimId) 
+      : selectedClaim;
+    
+    if (!claimToProcess) return;
 
     try {
-      // Validate claim exists first
-      const claimRef = doc(db, 'claims', selectedClaim.id);
+      // Update the claim status
+      const claimRef = doc(db, 'claims', claimToProcess.id);
       await updateDoc(claimRef, {
         status: isApproved ? 'approved' : 'rejected',
-        updatedAt: serverTimestamp()
+        updatedAt: serverTimestamp(),
+        processedBy: auth.currentUser.uid,
+        processedAt: serverTimestamp()
       });
 
-      // Update item status
-      await updateDoc(itemRef, {
-        claimStatus: isApproved ? 'approved' : 'rejected',
-        status: isApproved ? 'returned' : 'found',
-        updatedAt: serverTimestamp()
-      });
-  
-
-      // Update chat status if approved
+      // If approved, reject all other pending claims for this item
       if (isApproved) {
-        const chatsQuery = query(
-          collection(db, 'chats'),
-          where('itemId', '==', selectedClaim.id)
+        const otherClaimsQuery = query(
+          collection(db, 'claims'),
+          where('itemId', '==', claimToProcess.itemId),
+          where('status', '==', 'pending')
         );
-        const chatSnap = await getDocs(chatsQuery);
         
-        chatSnap.forEach(async (chatDoc) => {
-          await updateDoc(chatDoc.ref, {
+        const otherClaimsSnap = await getDocs(otherClaimsQuery);
+        const batch = writeBatch(db);
+        
+        otherClaimsSnap.forEach((doc) => {
+          if (doc.id !== claimToProcess.id) {
+            batch.update(doc.ref, {
+              status: 'rejected',
+              updatedAt: serverTimestamp(),
+              rejectionReason: 'Another claim was approved for this item'
+            });
+          }
+        });
+        
+        await batch.commit();
+
+        // Update the item status
+        const itemRef = doc(db, 'items', claimToProcess.itemId);
+        await updateDoc(itemRef, {
+          claimStatus: 'approved',
+          status: 'returned',
+          updatedAt: serverTimestamp(),
+          returnedTo: claimToProcess.claimantId
+        });
+
+        // Update chat status
+        if (claimToProcess.chatId) {
+          const chatRef = doc(db, 'chats', claimToProcess.chatId);
+          await updateDoc(chatRef, {
             status: 'active',
             updatedAt: serverTimestamp()
           });
-        });
+        }
       }
 
-      // Create notification promises
+      // Send notifications
       const notificationPromises = [
+        // To claimant
         addDoc(collection(db, 'notifications'), {
-          userId: selectedClaim.claimantId,
+          userId: claimToProcess.claimantId,
           type: isApproved ? 'claim_approved' : 'claim_rejected',
-          itemId: selectedClaim.id,
-          itemTitle: selectedClaim.title,
+          itemId: claimToProcess.itemId,
+          itemTitle: claimToProcess.itemTitle || claimToProcess.title,
           read: false,
           createdAt: serverTimestamp()
         }),
+        // To finder
         addDoc(collection(db, 'notifications'), {
-          userId: selectedClaim.postedBy?.userId,
+          userId: claimToProcess.finderId,
           type: 'claim_processed',
-          itemId: selectedClaim.id,
-          itemTitle: selectedClaim.title,
+          itemId: claimToProcess.itemId,
+          itemTitle: claimToProcess.itemTitle || claimToProcess.title,
           approved: isApproved,
           read: false,
           createdAt: serverTimestamp()
         })
       ];
 
-      // Send notifications
       await Promise.all(notificationPromises);
 
       toast.success(`Claim ${isApproved ? 'approved' : 'rejected'} successfully!`);
@@ -138,7 +179,6 @@ const AdminDashboard = () => {
     } catch (error) {
       console.error('Verification error:', error);
       toast.error(error.message || `Failed to ${isApproved ? 'approve' : 'reject'} claim`);
-      setSelectedClaim(null); // Clear selection to prevent further errors
     }
   };
 
@@ -213,89 +253,62 @@ const AdminDashboard = () => {
 
       {activeTab === 'claims' ? (
         <div className="row">
-          <div className="col-md-6">
-            <div className="card mb-4">
-              <div className="card-header bg-primary text-white">
-                <h5>Pending Claims</h5>
-              </div>
-              <div className="card-body">
-                {pendingClaims.length === 0 ? (
-                  <div className="alert alert-info">No pending claims</div>
-                ) : (
-                  <div className="list-group">
-                    {pendingClaims.map(claim => (
-                      <button
-                        key={claim.id}
-                        className={`list-group-item list-group-item-action text-start ${
-                          selectedClaim?.id === claim.id ? 'active' : ''
-                        }`}
-                        onClick={() => setSelectedClaim(claim)}
-                      >
-                        <div className="d-flex justify-content-between align-items-start">
-                          <div>
-                            <h6>{claim.title}</h6>
-                            <small className="d-block">Category: {claim.category || 'Unknown'}</small>
-                            <small className="d-block">Claimant: {claim.claimantName || 'Unknown'}</small>
-                            <small className="d-block">Finder: {claim.finderName || 'Unknown'}</small>
+          <div className="col-md-12">
+            {pendingClaims.length === 0 ? (
+              <div className="alert alert-info">No pending claims</div>
+            ) : (
+              <div className="row">
+                {pendingClaims.map(claim => (
+                  <div key={claim.id} className="col-md-6 mb-4">
+                    <div className="card h-100">
+                      <div className="card-body">
+                        <div className="d-flex">
+                          <img 
+                            src={claim.images?.[0] || 'https://placehold.co/300x200?text=No+Image'} 
+                            alt={claim.itemTitle || claim.title}
+                            className="rounded me-3"
+                            style={{width: '100px', height: '100px', objectFit: 'cover'}}
+                          />
+                          <div className="flex-grow-1">
+                            <h5>{claim.itemTitle || claim.title}</h5>
+                            <p className="mb-1"><strong>Category:</strong> {claim.category || 'Unknown'}</p>
+                            <p className="mb-1"><strong>Claimant:</strong> {claim.claimantName}</p>
+                            <p className="mb-1"><strong>Finder:</strong> {claim.finderName || claim.postedBy?.name || 'Unknown'}</p>
+                            <p className="mb-1"><strong>Submitted:</strong> {formatDate(claim.createdAt)}</p>
+                            
+                            <div className="mt-3 d-flex justify-content-between">
+                              {claim.chatId && (
+                                <button 
+                                  className="btn btn-sm btn-outline-primary"
+                                  onClick={() => navigate(`/chat/${claim.chatId}`)}
+                                >
+                                  View Chat
+                                </button>
+                              )}
+                              
+                              <div>
+                                <button 
+                                  className="btn btn-sm btn-danger me-2"
+                                  onClick={() => handleVerifyClaim(false, claim.id)}
+                                >
+                                  Reject
+                                </button>
+                                <button 
+                                  className="btn btn-sm btn-success"
+                                  onClick={() => handleVerifyClaim(true, claim.id)}
+                                >
+                                  Approve
+                                </button>
+                              </div>
+                            </div>
                           </div>
-                          <small className="text-muted">{claim.formattedDate}</small>
                         </div>
-                        <small className="d-block mt-2">
-                          Claim submitted: {claim.claimDate || 'Unknown date'}
-                        </small>
-                      </button>
-                    ))}
+                      </div>
+                    </div>
                   </div>
-                )}
+                ))}
               </div>
-            </div>
-          </div>
-
-          <div className="col-md-6">
-            <div className="card">
-              <div className="card-header bg-info text-white">
-                <h5>Claim Verification</h5>
-              </div>
-              <div className="card-body">
-                {selectedClaim ? (
-                  <>
-                    <h4>{selectedClaim.title}</h4>
-                    <div className="mb-3">
-                      <p><strong>Category:</strong> {selectedClaim.category || 'Unknown'}</p>
-                      <p><strong>Claimant:</strong> {selectedClaim.claimantName || selectedClaim.claimantId || 'Unknown'}</p>
-                      <p><strong>Finder:</strong> {selectedClaim.finderName || selectedClaim.postedBy?.userId || 'Unknown'}</p>
-                      <p><strong>Submitted:</strong> {selectedClaim.formattedDate || selectedClaim.claimDate || 'Unknown date'}</p>
-                    </div>
-                    
-                    <div className="mb-3">
-                      <h5>Item Details</h5>
-                      <p>{selectedClaim.description || 'No description provided'}</p>
-                      <p><strong>Location:</strong> {selectedClaim.location?.name || 'Not specified'}</p>
-                    </div>
-                    
-                    <div className="d-flex gap-2 mt-4">
-                      <button
-                        onClick={() => handleVerifyClaim(false)}
-                        className="btn btn-danger flex-grow-1"
-                      >
-                        Reject Claim
-                      </button>
-                      <button
-                        onClick={() => handleVerifyClaim(true)}
-                        className="btn btn-success flex-grow-1"
-                      >
-                        Approve Claim
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="text-center text-muted py-4">
-                    <i className="bi bi-card-checklist fs-1"></i>
-                    <p>Select a claim to verify</p>
-                  </div>
-                )}
-              </div>
-            </div>
+            )}
           </div>
         </div>
       ) : (
