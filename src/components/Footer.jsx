@@ -84,6 +84,7 @@ const Footer = () => {
         {/* Copyright Section */}
         <div className="row">
           <div className="col-12 text-center">
+          <p className="mb-0">Designed & Developed By Team RIT</p>
             <p className="mb-0">© {currentYear} Findr. All rights reserved.</p>
           </div>
         </div>
